@@ -1,9 +1,8 @@
 #include <avr/io.h>
-#include <util/delay.h>
 
 #define F_CPU 1000000UL
-#define sei(); SREG |= (1 << 7);
-#define cli(); SREG &= ~(1 << 7);
+#define sei() SREG |= (1 << 7)
+#define cli() SREG &= ~(1 << 7)
 #define setFlag(flag) Flags |= (1 << flag)
 #define clearFlag(flag) Flags &= ~(1 << flag)
 
@@ -83,8 +82,10 @@ uint8_t menuOption = 0;
 #define ADDR_HOURCOUNTER_LO 0
 #define ADDR_HOURCOUNTER_HI 1
 
+volatile uint8_t timer0OVFcounter = 0;
 
-void TIMER1_COMPA_vect() {	//64Hz LCD driver
+
+void TIM1_COMPA_vect() {	//64Hz LCD driver
 	//toggle BP and calculate buffer
 	if((Flags & (1 << SPIphase)) == 0) {	//phase 0
 		SPIbuffer = LCDstates;
@@ -116,11 +117,15 @@ void PCINT0_vect() {	//PCINT for button 1 and 2 (active low)
 	else clearFlag(B2FLAG);
 }
 
+void TIM0_OVF_vect() {
+	timer0OVFcounter++;
+}
+
 void initTimer1() {
 	TCCR1A = 0;
 	TCCR1B = TCCR1B |= (1 << WGM12);	//CTC operation
 	TCCR1B = TCCR1B |= (1 << CS11);		//8 prescaler
-	OCR1A = F_CPU / 8 / 64;				//set up 64Hz interrupt frequency
+	OCR1A = (uint16_t)(F_CPU / 8 / 64);	//set up 64Hz interrupt frequency (maxval 65535)
 	TIMSK1 |= (1 << OCIE1A);			//enable COMPA interrupt
 }
 
@@ -143,15 +148,6 @@ void displayNumber(uint8_t position, uint8_t number) {
 	}
 }
 
-void incrementHours() {
-	hourCounter++;
-	if(hourCounter > 9999) hourCounter = 0;
-	if(hourCounter % 2 == 0) {
-		saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
-		saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
-	}
-}
-
 void saveEEPROM(uint8_t value, uint8_t address) {
 	if (address >= EEPROM_SIZE) return;
 	EEARH = 0;	//high address byte for parts with >256 bytes
@@ -163,12 +159,41 @@ void saveEEPROM(uint8_t value, uint8_t address) {
 }
 
 uint8_t loadEEPROM(uint8_t address) {
-	if (address >= EEPROM_SIZE) return;
-	while (EECR & (1 << EEPE) != 0) {};	//wait for previous operation to complete
+	if (address >= EEPROM_SIZE) return 0xFF;
+	while ((EECR & (1 << EEPE)) != 0) {}	//wait for previous operation to complete
 	EEARH = 0;	//high address byte for parts with >256 bytes
 	EEARL = address;
 	EECR = (1 << EERE);	//enable read
 	return EEDR;
+}
+
+void incrementHours() {
+	hourCounter++;
+	if(hourCounter > 9999) hourCounter = 0;
+	if(hourCounter % 2 == 0) {
+		saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
+		saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
+	}
+}
+
+uint16_t getHoldTime(uint8_t option) {
+	TCCR0A = 0;
+	TCCR0B = (1 << CS00) | (1 << CS02);	//prescaler 1024
+	TIMSK0 = (1 << TOIE0);				//enable overflow interrupt
+	TCNT0 = 0;							//reset timer
+	timer0OVFcounter = 0;
+	switch (option) {
+		case 1:	//button 1
+			while ((Flags & (1 << B1FLAG)) != 0) {}
+		break;
+		case 2:	//button 2
+			while ((Flags & (1 << B2FLAG)) != 0) {}
+		break;
+		case 3: //both buttons
+			while ((Flags & (1 << B1FLAG)) != 0 && (Flags & (1 << B2FLAG)) != 0) {}
+		break;
+	}
+	return (1024UL * 1000UL / F_CPU) * (TCNT0 + (0xFF * timer0OVFcounter));	//return time in ms (max 65280)
 }
 
 int main(void) {
@@ -177,6 +202,7 @@ int main(void) {
 	initUSI();
 	initButtons();
 	sei();
+	hourCounter = loadEEPROM(ADDR_HOURCOUNTER_LO) | (loadEEPROM(ADDR_HOURCOUNTER_HI) << 8);
 	
     while (1) {
 		switch (display) {
