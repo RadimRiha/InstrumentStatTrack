@@ -1,4 +1,5 @@
 #include <avr/io.h>
+#include <util/delay.h>
 
 #define F_CPU 1000000UL
 #define sei(); SREG |= (1 << 7);
@@ -78,6 +79,10 @@ uint8_t display = DISP_OFF;
 uint16_t hourCounter = 0;
 uint8_t menuOption = 0;
 
+#define EEPROM_SIZE 128
+#define ADDR_HOURCOUNTER_LO 0
+#define ADDR_HOURCOUNTER_HI 1
+
 
 void TIMER1_COMPA_vect() {	//64Hz LCD driver
 	//toggle BP and calculate buffer
@@ -136,6 +141,34 @@ void displayNumber(uint8_t position, uint8_t number) {
 		if(font[number][segment] == 0) LCDstates &= ~(1 << LCDpinMap[segment + position * 8]);
 		else LCDstates |= (1 << LCDpinMap[segment + position * 8]);
 	}
+}
+
+void incrementHours() {
+	hourCounter++;
+	if(hourCounter > 9999) hourCounter = 0;
+	if(hourCounter % 2 == 0) {
+		saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
+		saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
+	}
+}
+
+void saveEEPROM(uint8_t value, uint8_t address) {
+	if (address >= EEPROM_SIZE) return;
+	EEARH = 0;	//high address byte for parts with >256 bytes
+	EEARL = address;
+	EEDR = value;
+	EECR = (1 << EEMPE);	//erase + write, enable program
+	EECR |= (1 << EERE);	//execute write
+	//_delay_ms(5);	//wait for operation to complete (3.4ms)
+}
+
+uint8_t loadEEPROM(uint8_t address) {
+	if (address >= EEPROM_SIZE) return;
+	while (EECR & (1 << EEPE) != 0) {};	//wait for previous operation to complete
+	EEARH = 0;	//high address byte for parts with >256 bytes
+	EEARL = address;
+	EECR = (1 << EERE);	//enable read
+	return EEDR;
 }
 
 int main(void) {
