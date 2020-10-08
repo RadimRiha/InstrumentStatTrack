@@ -5,6 +5,7 @@
 #define cli() SREG &= ~(1 << 7)
 #define setFlag(flag) Flags |= (1 << flag)
 #define clearFlag(flag) Flags &= ~(1 << flag)
+#define readFlag(flag) (Flags & (1 << flag)) >> flag
 
 //pins: DO-PA5 SCK-PA4 LE-PA7 IN-PA3,PB2 B1-PA0 B2-PA1
 #define LCD_BP 1
@@ -61,9 +62,12 @@ const uint8_t font[10][7] = {
 };
 
 //software boolean flags
-#define B1FLAG 0
-#define B2FLAG 1
-#define SPIphase 2
+#define B1_FLAG 0
+#define B2_FLAG 1
+#define B1_FALLING_FLAG 2
+#define B2_FALLING_FLAG 3
+#define SPI_PHASE_FLAG 4
+#define RELEASED_FLAG 5
 volatile uint8_t Flags = 0;
 
 uint32_t LCDstates = 0;		//stores segment states, LCD_BP ignored
@@ -74,9 +78,9 @@ volatile uint32_t SPIbuffer = 0;	//buffer for interrupt only
 #define DISP_MENU 253
 #define DISP_MENU_HOURS 0
 uint8_t display = DISP_OFF;
+uint8_t menuOption = 0;
 
 uint16_t hourCounter = 0;
-uint8_t menuOption = 0;
 
 #define EEPROM_SIZE 128
 #define ADDR_HOURCOUNTER_LO 0
@@ -87,15 +91,15 @@ volatile uint8_t timer0OVFcounter = 0;
 
 void TIM1_COMPA_vect() {	//64Hz LCD driver
 	//toggle BP and calculate buffer
-	if((Flags & (1 << SPIphase)) == 0) {	//phase 0
+	if(readFlag(SPI_PHASE_FLAG) == 0) {	//phase 0
 		SPIbuffer = LCDstates;
-		SPIbuffer &= ~((Flags & (1 << SPIphase)) >> SPIphase) << LCD_BP;
-		setFlag(SPIphase);
+		SPIbuffer &= ~(readFlag(SPI_PHASE_FLAG) << LCD_BP);
+		setFlag(SPI_PHASE_FLAG);
 	}
 	else {	//phase 1
 		SPIbuffer = ~LCDstates;
-		SPIbuffer |= ((Flags & (1 << SPIphase)) >> SPIphase) << LCD_BP;
-		clearFlag(SPIphase);
+		SPIbuffer |= readFlag(SPI_PHASE_FLAG) << LCD_BP;
+		clearFlag(SPI_PHASE_FLAG);
 	}
 	//SPI transfer MSB first
 	uint8_t USIclock = USICR |= (1 << USICLK);
@@ -111,10 +115,16 @@ void TIM1_COMPA_vect() {	//64Hz LCD driver
 }
 
 void PCINT0_vect() {	//PCINT for button 1 and 2 (active low)
-	if((PINA & (1 << PA0)) == 0) setFlag(B1FLAG);
-	else clearFlag(B1FLAG);
-	if((PINA & (1 << PA1)) == 0) setFlag(B2FLAG);
-	else clearFlag(B2FLAG);
+	if((PINA & (1 << PA0)) == 0) setFlag(B1_FLAG);
+	else {
+		clearFlag(B1_FLAG);
+		setFlag(B1_FALLING_FLAG);
+	}
+	if((PINA & (1 << PA1)) == 0) setFlag(B2_FLAG);
+	else {
+		clearFlag(B2_FLAG);
+		setFlag(B2_FALLING_FLAG);
+	}
 }
 
 void TIM0_OVF_vect() {
@@ -142,6 +152,7 @@ void initButtons() {
 }
 
 void displayNumber(uint8_t position, uint8_t number) {
+	if (number >= 10 || position >= 4) return;
 	for (uint8_t segment = 0; segment <= 6; segment++) {
 		if(font[number][segment] == 0) LCDstates &= ~(1 << LCDpinMap[segment + position * 8]);
 		else LCDstates |= (1 << LCDpinMap[segment + position * 8]);
@@ -159,7 +170,7 @@ void saveEEPROM(uint8_t value, uint8_t address) {
 }
 
 uint8_t loadEEPROM(uint8_t address) {
-	if (address >= EEPROM_SIZE) return 0xFF;
+	if (address >= EEPROM_SIZE) return 0;
 	while ((EECR & (1 << EEPE)) != 0) {}	//wait for previous operation to complete
 	EEARH = 0;	//high address byte for parts with >256 bytes
 	EEARL = address;
@@ -176,27 +187,70 @@ void incrementHours() {
 	}
 }
 
-uint16_t getHoldTime(uint8_t option) {
+uint16_t getTime () {
+	return (1024UL * 1000UL / F_CPU) * (TCNT0 + (0xFF * timer0OVFcounter));
+}
+
+uint8_t holdLongerThan(uint8_t option, uint16_t duration) {
 	TCCR0A = 0;
 	TCCR0B = (1 << CS00) | (1 << CS02);	//prescaler 1024
 	TIMSK0 = (1 << TOIE0);				//enable overflow interrupt
 	TCNT0 = 0;							//reset timer
 	timer0OVFcounter = 0;
 	switch (option) {
+		case 0: //any button
+			while (readFlag(B1_FLAG) || readFlag(B2_FLAG)) {
+				clearFlag(RELEASED_FLAG);
+				if (getTime() > duration) return 1;
+			}
+		break;
 		case 1:	//button 1
-			while ((Flags & (1 << B1FLAG)) != 0) {}
+			while (readFlag(B1_FLAG)) {
+				clearFlag(RELEASED_FLAG);
+				if (getTime() > duration) return 1;
+			}
 		break;
 		case 2:	//button 2
-			while ((Flags & (1 << B2FLAG)) != 0) {}
+			while (readFlag(B2_FLAG)) {
+				clearFlag(RELEASED_FLAG);
+				if (getTime() > duration) return 1;
+			}
 		break;
 		case 3: //both buttons
-			while ((Flags & (1 << B1FLAG)) != 0 && (Flags & (1 << B2FLAG)) != 0) {}
+			while (readFlag(B1_FLAG) && readFlag(B2_FLAG)) {
+				clearFlag(RELEASED_FLAG);
+				if (getTime() > duration) return 1;
+			}
 		break;
 	}
-	return (1024UL * 1000UL / F_CPU) * (TCNT0 + (0xFF * timer0OVFcounter));	//return time in ms (max 65280)
+	return 0;
 }
 
-int main(void) {
+uint8_t release (uint8_t option) {
+	switch (option) {
+		case 1:
+			if (readFlag(B1_FALLING_FLAG)) {
+				clearFlag(B1_FALLING_FLAG);
+				return 1;
+			}
+		break;
+		case 2:
+			if (readFlag(B2_FALLING_FLAG)) {
+				clearFlag(B2_FALLING_FLAG);
+				return 1;
+			}
+		break;
+	}
+	return 0;
+}
+
+void waitForRelease () {
+	if (readFlag(RELEASED_FLAG)) return;
+	while (readFlag(B1_FLAG) || readFlag(B2_FLAG)) {}
+	setFlag(RELEASED_FLAG);
+}
+
+int main (void) {
 	cli();
 	initTimer1();
 	initUSI();
@@ -208,20 +262,26 @@ int main(void) {
 		switch (display) {
 			case DISP_OFF:
 				LCDstates = 0;
-				if ((Flags & (1 << B1FLAG)) != 0 && Flags & ((1 << B2FLAG) != 0)) display = DISP_MENU;
-				else if ((Flags & (1 << B1FLAG)) != 0 || Flags & ((1 << B2FLAG) != 0)) display = DISP_HOURS;
+				if (holdLongerThan(0, 0)) display = DISP_HOURS;
 			break;
 			case DISP_HOURS:
 				displayNumber(0, hourCounter % 10);
 				displayNumber(1, hourCounter / 10 % 10);
 				displayNumber(2, hourCounter / 100 % 10);
 				displayNumber(3, hourCounter / 1000);
-				if ((Flags & (1 << B1FLAG)) != 0 && (Flags & (1 << B2FLAG)) != 0) display = DISP_MENU;
+				waitForRelease();
+				if (holdLongerThan(3, 500)) {
+					menuOption = 0;
+					display = DISP_MENU;
+				}
 			break;
 			case DISP_MENU:
-				if ((Flags & (1 << B1FLAG)) != 0 && (Flags & (1 << B2FLAG)) != 0) display = menuOption;
-				else if ((Flags & (1 << B1FLAG)) != 0) menuOption++;
-				else if ((Flags & (1 << B2FLAG)) != 0) menuOption--;
+				LCDstates = 0;
+				displayNumber(0, menuOption % 10);
+				waitForRelease();
+				if (holdLongerThan(3, 0)) display = menuOption;
+				else if (release(1)) menuOption++;
+				else if (release(2) && menuOption > 0) menuOption--;
 				if (menuOption >= 10) menuOption = 0;
 			break;
 			case DISP_MENU_HOURS:
@@ -229,9 +289,10 @@ int main(void) {
 				displayNumber(1, hourCounter / 10 % 10);
 				displayNumber(2, hourCounter / 100 % 10);
 				displayNumber(3, hourCounter / 1000);
-				if ((Flags & (1 << B1FLAG)) != 0 && (Flags & (1 << B2FLAG)) != 0) display = DISP_HOURS;
-				else if ((Flags & (1 << B1FLAG)) != 0) hourCounter++;
-				else if ((Flags & (1 << B2FLAG)) != 0) hourCounter--;
+				waitForRelease();
+				if (holdLongerThan(3, 0)) display = DISP_HOURS;
+				else if (release(1)) hourCounter++;
+				else if (release(2) && hourCounter > 0) hourCounter--;
 			break;
 		}
     }
