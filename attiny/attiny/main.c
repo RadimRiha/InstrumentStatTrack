@@ -1,4 +1,6 @@
 #include <avr/io.h>
+#include <avr/sleep.h>
+#include <util/delay.h>
 
 #define F_CPU 1000000UL
 #define sei() SREG |= (1 << 7)
@@ -64,7 +66,8 @@ volatile uint8_t B2_FLAG = 0;
 volatile uint8_t B1_FALLING_FLAG = 0;
 volatile uint8_t B2_FALLING_FLAG = 0;
 volatile uint8_t SPI_PHASE_FLAG = 0;
-volatile uint8_t RELEASED_FLAG = 0;
+uint8_t RELEASED_FLAG = 0;
+uint8_t SLEEPTIMERSTARTED_FLAG = 0;
 
 uint32_t LCDstates = 0;		//stores segment states, LCD_BP ignored
 volatile uint32_t SPIbuffer = 0;	//buffer for interrupt only
@@ -73,10 +76,11 @@ volatile uint32_t SPIbuffer = 0;	//buffer for interrupt only
 #define DISP_HOURS 254
 #define DISP_MENU 253
 #define DISP_MENU_HOURS 0
-uint8_t display = DISP_OFF;
+uint8_t display = DISP_HOURS;
 uint8_t menuOption = 0;
 
 uint16_t hourCounter = 0;
+uint8_t minuteCounter = 0;
 
 #define EEPROM_SIZE 128
 #define ADDR_HOURCOUNTER_LO 0
@@ -129,9 +133,9 @@ void TIM0_OVF_vect() {
 
 void initTimer1() {
 	TCCR1A = 0;
-	TCCR1B = TCCR1B |= (1 << WGM12);	//CTC operation
-	TCCR1B = TCCR1B |= (1 << CS11);		//8 prescaler
-	OCR1A = (uint16_t)(F_CPU / 8 / 64);	//set up 64Hz interrupt frequency (maxval 65535)
+	TCCR1B = (1 << WGM12);	//CTC operation
+	//TCCR1B |= (1 << CS11);		//1 prescaler
+	OCR1A = (uint16_t)(F_CPU / 64);	//set up 64Hz interrupt frequency (maxval 65535)
 	TIMSK1 |= (1 << OCIE1A);			//enable COMPA interrupt
 }
 
@@ -182,16 +186,20 @@ uint8_t loadEEPROM(uint8_t address) {
 	return EEDR;
 }
 
-void incrementHours() {
-	hourCounter++;
-	if(hourCounter > 9999) hourCounter = 0;
-	if(hourCounter % 2 == 0) {
-		saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
-		saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
-	}
+void incrementTime() {
+	minuteCounter += 5;
+	if (minuteCounter >= 60) {
+		hourCounter++;
+		if(hourCounter > 9999) hourCounter = 0;
+		if(hourCounter % 2 == 0) {
+			saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
+			saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
+		}
+		minuteCounter = 0;
+	}	
 }
 
-uint16_t getTime () {
+uint16_t getTC0Time () {
 	return (1024UL * 1000UL / F_CPU) * (TCNT0 + (0xFF * timer0OVFcounter));	//max 65s
 }
 
@@ -199,22 +207,22 @@ uint8_t holdLongerThan(uint8_t option, uint16_t duration) {
 	switch (option) {
 		case 0: //any button
 			while (B1_FLAG || B2_FLAG) {
-				if (getTime() > duration) return 1;
+				if (getTC0Time() > duration) return 1;
 			}
 		break;
 		case 1:	//button 1
 			while (B1_FLAG) {
-				if (getTime() > duration) return 1;
+				if (getTC0Time() > duration) return 1;
 			}
 		break;
 		case 2:	//button 2
 			while (B2_FLAG) {
-				if (getTime() > duration) return 1;
+				if (getTC0Time() > duration) return 1;
 			}
 		break;
 		case 3: //both buttons
 			while (B1_FLAG && B2_FLAG) {
-				if (getTime() > duration) return 1;
+				if (getTC0Time() > duration) return 1;
 			}
 		break;
 	}
@@ -252,6 +260,32 @@ void gotoDisp (uint8_t disp) {
 	RELEASED_FLAG = 0;
 }
 
+void gotoSleep (uint8_t mode) {
+	LCDstates = 0;
+	if (display != DISP_OFF) _delay_ms(20);	//wait for display to clear if it is on
+	switch (mode) {
+		case 0:	//no signal, WDT disabled
+			//disable WDT
+		break;
+		case 1:	//signal present, check again in 5 minutes
+			incrementTime();
+			//configure wdt
+		break;
+	}
+	MCUCR = (1 << SE) | (1 << SM1);	//enable sleep, power down
+	sleep_cpu();
+	MCUCR &= ~(1 << SE);	//disable sleep
+}
+
+void WDT_vect () {	//wake up with WDT interrupt
+	gotoSleep((PINA & (1 << PA3)) >> PA3);
+}
+
+void wakeUpInt () {	//wake up with PCINT
+	if ((PINA & (1 << PA3)) == 0) ;//wake up with buttons
+	else incrementTime();	//wake up with input comparator
+}
+
 int main (void) {
 	cli();
 	initTimer1();
@@ -259,9 +293,20 @@ int main (void) {
 	initUSI();
 	initButtons();
 	sei();
+	DDRA &= ~(1 << DDA3);	//IN input
 	hourCounter = loadEEPROM(ADDR_HOURCOUNTER_LO) | (loadEEPROM(ADDR_HOURCOUNTER_HI) << 8);
 	
     while (1) {
+		if (!B1_FLAG & !B2_FLAG){	//inactivity
+			if (!SLEEPTIMERSTARTED_FLAG) {
+				SLEEPTIMERSTARTED_FLAG = 1;
+				TCNT0 = 0;	//reset timer
+				timer0OVFcounter = 0;
+			}
+			else if (getTC0Time() > 30000) gotoSleep((PINA & (1 << PA3)) >> PA3);
+		}
+		else SLEEPTIMERSTARTED_FLAG = 0;
+		
 		switch (display) {
 			case DISP_OFF:
 				LCDstates = 0;
