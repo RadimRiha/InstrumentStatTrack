@@ -1,0 +1,2 @@
+command D:\Arduino\hardware\tools\avr/bin/avrdude.exe
+arguments -C"D:\Arduino\hardware\tools\avr/etc/avrdude.conf" -v -pattiny24 -cstk500v1 -PCOM4 -b19200 -Uflash:w:"$(ProjectDir)Debug\$(TargetName).hex":i
