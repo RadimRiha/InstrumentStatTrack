@@ -1,0 +1,1 @@
+avrdude -C C:\Users\radim\Desktop\avrdude_6.3\avrdude.conf -v -p atmega16u2 -c stk500v1 -P COM4 -b 19200 -D -U flash:w:C:\Users\Radim\Desktop\avrdude_6.3/Arduino-usbserial-atmega16u2-Uno-Rev3.hex:i

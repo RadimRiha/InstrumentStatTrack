@@ -6,7 +6,7 @@
 #include <util/delay.h>
 
 //options
-#define SLEEP_TIMEOUT 30	//inactivity before going to sleep [s]
+#define SLEEP_TIMEOUT 80	//inactivity before going to sleep [s]
 #define MENU_ENTER_TIME 1	//hold time before going to menu [s]
 
 //pins: DO-PA5 SCK-PA4 LE-PA7 IN-PA3,PB2 B1-PA0 B2-PA1
@@ -18,12 +18,12 @@
 #define LCD_1E 26
 #define LCD_1F 3
 #define LCD_1G 4
-#define LCD_1DP 30
+#define LCD_1DP 29
 #define LCD_2A 7
 #define LCD_2B 0
 #define LCD_2C 24
-#define LCD_2D 31
-#define LCD_2E 32
+#define LCD_2D 30
+#define LCD_2E 31
 #define LCD_2F 6
 #define LCD_2G 5
 #define LCD_2DP 17
@@ -50,7 +50,6 @@ volatile uint8_t B1_FALLING_FLAG = 0;
 volatile uint8_t B2_FALLING_FLAG = 0;
 volatile uint8_t SPI_PHASE_FLAG = 0;
 uint8_t RELEASED_FLAG = 0;
-uint8_t SLEEPTIMERSTARTED_FLAG = 0;
 
 //LCD functionality
 uint32_t LCDstates = 0;				//stores segment states, LCD_BP ignored
@@ -81,7 +80,7 @@ const uint8_t font[10] = {	//segments xGFEDCBA
 #define DISP_HOURS 254
 #define DISP_MENU 253
 #define DISP_MENU_HOURS 0
-uint8_t display = DISP_HOURS;
+uint8_t display = DISP_OFF;
 uint8_t menuOption = 0;
 
 //button functionality
@@ -154,11 +153,11 @@ ISR(WDT_vect) {	//wake up with WDT interrupt
 
 void initTimer1() {
 	TCCR1A = 0;
-	TCCR1B = (1 << WGM12);			//CTC operation
-	TCCR1B |= (1 << CS10);			//1 prescaler
-	OCR1A = (uint16_t)(F_CPU / 64);	//set up 64Hz interrupt frequency (maxval 65535)
-	TIMSK1 |= (1 << OCIE1A);		//enable COMPA interrupt
-	TCNT1 = 0;						//reset timer
+	TCCR1B = (1 << WGM12);				//CTC operation
+	TCCR1B |= (1 << CS10);				//1 prescaler
+	OCR1A = (uint16_t)(F_CPU / 64 / 2);	//set up 64Hz * 2 interrupt frequency (maxval 65535)
+	TIMSK1 |= (1 << OCIE1A);			//enable COMPA interrupt
+	TCNT1 = 0;							//reset timer
 }
 
 void initTimer0 () {
@@ -170,7 +169,7 @@ void initTimer0 () {
 }
 
 void initUSI() {
-	PORTA &= ~((1 << PA5) | (1 << PA4) | (1 << PA7));
+	PORTA &= ~(1 << PA7);
 	DDRA |= (1 << DDA5) | (1 << DDA4) | (1 << DDA7);	//DO,SCK,LE output
 	USICR = (1 << USIWM0);	//setup three wire mode
 }
@@ -235,14 +234,12 @@ uint16_t getTC0Time () {
 void gotoSleep (uint8_t mode) {
 	LCDstates = 0;
 	if (display != DISP_OFF) _delay_ms(20);	//wait for display to clear if it is on
-	switch (mode) {
-		case 0:	//no signal, WDT disabled
+	if (mode == 0) {		//no signal, WDT disabled
 			//disable WDT
-		break;
-		case 1:	//signal present, check again in 5 minutes
-			incrementTime();
-			//configure WDT
-		break;
+	}
+	else if (mode == 1) {	//signal present, check again in 5 minutes
+		incrementTime();
+		//configure WDT
 	}
 	MCUCR = (1 << SE) | (1 << SM1);	//enable sleep, power down
 	sleep_cpu();
@@ -323,6 +320,7 @@ int main (void) {
 	initButtons();
 	DDRA &= ~(1 << DDA3);	//IN input
 	hourCounter = loadEEPROM(ADDR_HOURCOUNTER_LO) | (loadEEPROM(ADDR_HOURCOUNTER_HI) << 8);
+	if (hourCounter > 9999) hourCounter = 0;
 	sei();
 	
     while (1) {
@@ -333,11 +331,7 @@ int main (void) {
 		}
 		
 		//display navigation
-		if (display == DISP_OFF) {
-			LCDstates = 0;
-			if (B1State == STATE_HIGH || B2State == STATE_HIGH) gotoDisp(DISP_HOURS);
-		}
-		else if (display == DISP_HOURS) {
+		if (display == DISP_HOURS) {
 			displayPrint(hourCounter);
 			waitForRelease();
 			if (B1State == STATE_HIGH && B2State == STATE_HIGH) {
