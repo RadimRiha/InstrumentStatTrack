@@ -1,14 +1,16 @@
 #include <avr/io.h>
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
+#include <avr/wdt.h>
 
 #define F_CPU 1000000UL
 #include <util/delay.h>
 
 //options
-#define SLEEP_TIMEOUT 30UL		//inactivity before going to sleep [s]
+#define SLEEP_TIMEOUT 15UL		//inactivity before going to sleep [s]
 #define MENU_ENTER_TIME 2UL		//hold time before going to menu [s]
 #define WKP_INTERVAL 80UL		//how often to wake up and check signal [s]
+#define SPEEDUP_TIME 1UL		//hold time before menu inc/dec speed up [s]
 
 //pins: DO-PA5 SCK-PA4 LE-PA7 IN-PB2 B1-PA0 B2-PA1
 #define LCD_BP 25
@@ -44,11 +46,19 @@
 #define LCD_4F 14
 #define LCD_4G 13
 
+//sleep functionality
+#define SLEEP_OFF 0
+#define SLEEP_SIGNAL 1
+#define SLEEP_CHECK 2
+#define SLEEP_WDTINC 3
+volatile uint8_t WDTcounter = 0;
+
 //software boolean flags
 volatile uint8_t B1_STATE_FLAG = 0;
 volatile uint8_t B2_STATE_FLAG = 0;
 volatile uint8_t SPI_PHASE_FLAG = 0;
 uint8_t RELEASED_FLAG = 0;
+volatile uint8_t NEXT_SLEEP_FLAG = SLEEP_OFF;
 
 //LCD functionality
 uint32_t LCDstates = 0;				//stores segment states, LCD_BP ignored
@@ -67,7 +77,7 @@ const uint8_t font[11] = {	//segments xGFEDCBA
 0b01011011,	  //2
 0b01001111,	  //3
 0b01100110,	  //4
-0b01001101,	  //5
+0b01101101,	  //5
 0b01111101,	  //6
 0b00000111,	  //7
 0b01111111,	  //8
@@ -102,7 +112,6 @@ uint16_t secondCounter = 0;
 
 //general timing
 volatile uint8_t timer0OVFcounter = 0;
-volatile uint8_t WDTcounter = 0;
 
 //function declaration
 void gotoSleep(uint8_t mode);
@@ -136,8 +145,9 @@ ISR(TIM1_COMPA_vect) {	//64Hz LCD driver
 }
 
 ISR(PCINT0_vect) {	//PCINT for button 1 and 2 (active low)
-	if (display == DISP_OFF) {	//after WKP
+	if (display == DISP_OFF) {			//after WKP
 		display = DISP_HOURS;
+		NEXT_SLEEP_FLAG = SLEEP_OFF;	//don't go to sleep
 		disableWKPinterrupts();
 	}
 	if ((PINA & (1 << PA0)) == 0) B1_STATE_FLAG = 1;
@@ -151,12 +161,12 @@ ISR(TIM0_OVF_vect) {
 }
 
 ISR(WDT_vect) {	//wake up with WDT interrupt
-	if (WDTcounter >= (WKP_INTERVAL / 8)) gotoSleep((PINA & (1 << PB2)) >> PB2);	//check signal
-	else gotoSleep(2);	//sleep for longer
+	if (WDTcounter >= (WKP_INTERVAL / 8)) NEXT_SLEEP_FLAG = SLEEP_CHECK;	//check signal
+	else NEXT_SLEEP_FLAG = SLEEP_WDTINC;	//sleep for longer
 }
 
 ISR(EXT_INT0_vect) {	//wake up with INT0 level
-	gotoSleep(0);
+	NEXT_SLEEP_FLAG = SLEEP_SIGNAL;	//signal present
 }
 
 void saveEEPROM(uint8_t value, uint8_t address) {
@@ -176,7 +186,6 @@ uint8_t loadEEPROM(uint8_t address) {
 }
 
 void displayNumber(uint8_t position, uint8_t number) {
-	if (number > 10 || position > 3) return;
 	for (uint8_t segment = 0; segment <= 6; segment++) {
 		if ((font[number] & (1 << segment)) == 0) LCDstates &= ~(1UL << LCDpinMap[segment + position * 8]);
 		else LCDstates |= (1UL << LCDpinMap[segment + position * 8]);
@@ -202,7 +211,7 @@ void incrementTime() {
 			saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
 			saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
 		}
-		secondCounter = 0;
+		secondCounter -= 3600;
 	}
 }
 
@@ -217,29 +226,39 @@ void gotoSleep(uint8_t mode) {
 	
 	cli();
 	disableWKPinterrupts();
-	if (mode == 0) {						//signal present, check again using WDT in WKP_INTERVAL seconds
-		incrementTime();
-		WDTCSR |= (1 << WDP3) | (1 << WDP0);//WKP every 8 seconds
-		WDTCSR |= (1 << WDIE) | (1 << WDE);	//enable WDT
-		WDTcounter = 1;
-	}
-	else if (mode == 1) {					//no signal, WKP with INT0 level
+	if (mode == 0) {						//no signal, WKP with INT0 level
 		GIMSK |= (1 << INT0);				//INT0 enabled
 	}
-	else if (mode == 2) {					//WKP from WDT
-		WDTCSR |= (1 << WDIE) | (1 << WDE);	//enable WDT
+	else if (mode == 1) {					//signal present, check again using WDT in WKP_INTERVAL seconds
+		incrementTime();
+		WDTCSR = (1<<WDCE)|(1<<WDE);
+		WDTCSR = 0;
+		WDTCSR |= (1 << WDP3) | (1 << WDP0);//WKP every 8 seconds
+		WDTCSR |= (1 << WDIE);				//enable WDT
+		WDTcounter = 1;
+	}
+	else if (mode == 2) {					//WKP from WDT, increment counter
+		WDTCSR |= (1 << WDIE);				//enable WDT
 		WDTcounter++;
 	}
-	MCUCR = (1 << SE) | (1 << SM1);			//enable sleep, power down
+	MCUCR |= (1 << SE) | (1 << SM1);		//enable sleep, power down
 	sei();
-	sleep_cpu();
+	sleep_cpu();							//go to sleep
 	MCUCR &= ~(1 << SE);					//disable sleep
+}
+
+void sleepCheck() {
+	uint8_t activity = 0;
+	for (uint16_t i = 0; i < 500; i++) {	//check input for 50ms at 10kHz
+		if ((PINB & (1 << PB2)) == 0) activity = 1;
+		_delay_us(100);
+	}
+	gotoSleep(activity);
 }
 
 void disableWKPinterrupts() {
 	GIMSK &= ~(1 << INT0);	//INT0 disabled
-	WDTCSR |= (1 << WDCE);	//WDT disabled
-	WDTCSR &= ~((1 << WDE) | (1 << WDIE));
+	WDTCSR &= ~(1 << WDIE);	//WDT disabled
 }
 
 void updateButtonStates() {
@@ -281,9 +300,7 @@ void waitForRelease() {
 
 void gotoDisp(uint8_t disp) {
 	display = disp;
-	for (uint8_t d = 0; d <= 3; d++){
-		displayNumber(d, 0);
-	}
+	LCDstates = 0;
 	_delay_ms(300);
 	RELEASED_FLAG = 0;
 }
@@ -316,9 +333,12 @@ int main(void) {
 	
     while (1) {
 		updateButtonStates();
+		if (NEXT_SLEEP_FLAG == SLEEP_SIGNAL) gotoSleep(1);
+		else if (NEXT_SLEEP_FLAG == SLEEP_CHECK) sleepCheck();
+		else if (NEXT_SLEEP_FLAG == SLEEP_WDTINC) gotoSleep(2);
 		//inactivity sleep timing
 		if (B1State == STATE_LOW && B2State == STATE_LOW) {
-			if (getTC0Time() - BothButtonsReleaseStamp >= SLEEP_TIMEOUT * 1000UL) gotoSleep((PINA & (1 << PB2)) >> PB2);
+			if (getTC0Time() - BothButtonsReleaseStamp >= SLEEP_TIMEOUT * 1000UL) sleepCheck();
 		}
 		//display navigation
 		if (display == DISP_HOURS) {
@@ -332,9 +352,10 @@ int main(void) {
 			displayPrint(hourCounter);
 			waitForRelease();
 			if (B1State == STATE_HIGH && B2State == STATE_HIGH) gotoDisp(DISP_HOURS);
-			if (B2State == STATE_FALLING) hourCounter++;
-			if (B1State == STATE_FALLING) hourCounter--;
-			if (hourCounter > 9999) hourCounter = 9999;
+			if (B2State == STATE_FALLING && hourCounter < 9999) hourCounter++;
+			if (B1State == STATE_FALLING && hourCounter > 0) hourCounter--;
+			//if (B2State == STATE_HIGH && (getTC0Time() - B2PressStamp >= SPEEDUP_TIME * 1000UL)) hourCounter += 25;
+			//if (B1State == STATE_HIGH && (getTC0Time() - B2PressStamp >= SPEEDUP_TIME * 1000UL)) hourCounter -= 25;
 		}
     }
 }
