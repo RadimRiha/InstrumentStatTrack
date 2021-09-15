@@ -122,13 +122,12 @@ ISR(TIM1_COMPA_vect) {	//64Hz LCD driver
 	if (SPI_PHASE_FLAG == 0) {	//phase 0
 		SPIbuffer = LCDstates;
 		SPIbuffer &= ~(1UL << LCD_BP);
-		SPI_PHASE_FLAG = 1;
 	}
 	else {	//phase 1
 		SPIbuffer = ~LCDstates;
 		SPIbuffer |= (1UL << LCD_BP);
-		SPI_PHASE_FLAG = 0;
 	}
+	SPI_PHASE_FLAG = !SPI_PHASE_FLAG;
 	//SPI transfer MSB first
 	uint8_t USIclock = USICR | (1 << USITC);
 	uint8_t USIshift = USICR | (1 << USITC) | (1 << USICLK);
@@ -170,15 +169,15 @@ ISR(EXT_INT0_vect) {	//wake up with INT0 level
 }
 
 void saveEEPROM(uint8_t value, uint8_t address) {
+	while ((EECR & (1 << EEPE)) != 0) {}	//wait for previous operation to complete
 	EEARH = 0;				//high address byte for parts with >256 bytes
 	EEARL = address;
 	EEDR = value;
 	EECR = (1 << EEMPE);	//erase + write, enable program
-	EECR |= (1 << EERE);	//execute write
+	EECR |= (1 << EEPE);	//execute write
 }
 
 uint8_t loadEEPROM(uint8_t address) {
-	while ((EECR & (1 << EEPE)) != 0) {}	//wait for previous operation to complete
 	EEARH = 0;								//high address byte for parts with >256 bytes
 	EEARL = address;
 	EECR = (1 << EERE);						//enable read
@@ -207,10 +206,8 @@ void incrementTime() {
 	if (secondCounter >= 3600) {
 		hourCounter++;
 		if (hourCounter > 9999) hourCounter = 0;
-		if (hourCounter % 2 == 0) {	//save every other hour
-			saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
-			saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
-		}
+		saveEEPROM((uint8_t)hourCounter, ADDR_HOURCOUNTER_LO);
+		saveEEPROM((uint8_t)(hourCounter >> 8), ADDR_HOURCOUNTER_HI);
 		secondCounter -= 3600;
 	}
 }
@@ -231,20 +228,22 @@ void gotoSleep(uint8_t mode) {
 	}
 	else if (mode == 1) {					//signal present, check again using WDT in WKP_INTERVAL seconds
 		incrementTime();
-		WDTCSR = (1<<WDCE)|(1<<WDE);
-		WDTCSR = 0;
-		WDTCSR |= (1 << WDP3) | (1 << WDP0);//WKP every 8 seconds
-		WDTCSR |= (1 << WDIE);				//enable WDT
+		WDTCSR |= (1 << WDE) | (1 << WDIE)| (1 << WDP3) | (1 << WDP0);	//WKP every 8 seconds
 		WDTcounter = 1;
 	}
 	else if (mode == 2) {					//WKP from WDT, increment counter
-		WDTCSR |= (1 << WDIE);				//enable WDT
+		WDTCSR |= (1 << WDE) | (1 << WDIE)| (1 << WDP3) | (1 << WDP0);	//WKP every 8 seconds
 		WDTcounter++;
 	}
 	MCUCR |= (1 << SE) | (1 << SM1);		//enable sleep, power down
 	sei();
 	sleep_cpu();							//go to sleep
 	MCUCR &= ~(1 << SE);					//disable sleep
+	timer0OVFcounter = 0;
+	BothButtonsReleaseStamp = 0;
+	BothButtonsPressStamp = 0;
+	B1PressStamp = 0;
+	B2PressStamp = 0;
 }
 
 void sleepCheck() {
@@ -257,8 +256,10 @@ void sleepCheck() {
 }
 
 void disableWKPinterrupts() {
-	GIMSK &= ~(1 << INT0);	//INT0 disabled
-	WDTCSR &= ~(1 << WDIE);	//WDT disabled
+	GIMSK &= ~(1 << INT0);				//INT0 disabled
+	//WDTCSR &= ~(1 << WDIE);	
+	WDTCSR = (1 << WDCE) | (1 << WDE);	//WDT disabled
+	WDTCSR = 0;
 }
 
 void updateButtonStates() {
